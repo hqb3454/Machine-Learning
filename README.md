@@ -87,7 +87,17 @@ Top-5 推荐：商品 85123A, 商品 22423, 商品 85099B, 商品 20725, 商品 
 | RMSprop | 对非平稳目标较稳 |
 | Adagrad | 对稀疏特征较友好 |
 
-优化器切换位置在 `train_sequence_recommender.py` 的 `build_optimizer()`：
+本项目将训练脚本拆分为三个模型专用文件，每个文件内置 4 种优化器（SGD / Adam / RMSprop / Adagrad）的对比：
+
+| 训练文件 | 模型 | 默认优化器配置 |
+|---|---|---|
+| `train_mlp.py` | MLP | 4 种优化器各跑一遍 |
+| `train_lstm.py` | LSTM | 4 种优化器各跑一遍 |
+| `train_sasrec.py` | SASRec | 4 种优化器各跑一遍 |
+
+公共的数据加载、预处理、评估指标、可视化逻辑放在 `recommender_utils.py` 中，三个训练文件共享。
+
+优化器定义在 `recommender_utils.py` 的 `build_optimizer()`：
 
 ```python
 def build_optimizer(name: str, params, lr: float, weight_decay: float):
@@ -102,14 +112,7 @@ def build_optimizer(name: str, params, lr: float, weight_decay: float):
         return torch.optim.Adagrad(params, lr=lr, weight_decay=weight_decay)
 ```
 
-也就是说，改优化器有两种方式：
-
-```bash
-python train_sequence_recommender.py --model lstm --optimizer adam
-python train_sequence_recommender.py --model sasrec --optimizer rmsprop
-```
-
-如果要新增优化器，例如 `AdamW`，就在 `build_optimizer()` 中增加：
+如果要新增优化器，例如 `AdamW`，就在 `recommender_utils.py` 的 `build_optimizer()` 中增加：
 
 ```python
 if name == "adamw":
@@ -136,43 +139,51 @@ data/Online Retail.xlsx
 
 ## 6. 运行实验
 
-跑单个模型和优化器：
+### 6.1 跑单个模型（自动对比 4 种优化器）
 
 ```bash
-python train_sequence_recommender.py --model sasrec --optimizer adam --epochs 10
+python train_mlp.py
+python train_lstm.py
+python train_sasrec.py
 ```
 
-跑 3 种模型 x 4 种优化器的全部组合：
+每个命令会依次用 **SGD、Adam、RMSprop、Adagrad** 训练同一模型，并生成对比图表。
+
+### 6.2 只跑部分优化器
+
+如果只想对比 Adam 和 RMSprop：
 
 ```bash
-python train_sequence_recommender.py --model all --optimizer all --epochs 10
+python train_mlp.py --optimizers adam,rmsprop
 ```
 
-为了快速演示，可以减小样本量：
+### 6.3 快速演示（小样本）
 
 ```bash
-python train_sequence_recommender.py --model all --optimizer all --epochs 5 --max-samples 8000
+python train_mlp.py --max-samples 2000 --epochs 10
+python train_lstm.py --max-samples 2000 --epochs 10
+python train_sasrec.py --max-samples 2000 --epochs 10
 ```
 
-`--model all` 会依次运行：
+### 6.4 各模型推荐超参数
 
-```text
-MLP + LSTM + SASRec
-```
+三个脚本已经为对应模型配置了较合适的默认超参数。关键区别如下：
 
-每个模型都会分别搭配：
+| 超参数 | MLP | LSTM | SASRec |
+|---|---|---|---|
+| `--embedding-dim` | 64 | 64 | 64 |
+| `--hidden-dim` | 128 | 128 | 64 |
+| `--num-layers` | 2（FC） | 2 | 2（Attention） |
+| `--dropout` | 0.2 | 0.3 | 0.2 |
+| `--max-seq-len` | 30 | 50 | 50 |
+| `--lr` | 1e-3 | 1e-3 | 5e-4 |
+| `--batch-size` | 256 | 256 | 128 |
+| `--epochs` | 50 | 50 | 80 |
+| `--patience` | 6 | 6 | 10 |
 
-```text
-SGD + Adam + RMSprop + Adagrad
-```
+SASRec 因为 Transformer 收敛更慢，设置了更多的 epoch 和更宽松的 early stopping patience。
 
-SASRec 额外常用参数：
-
-```bash
-python train_sequence_recommender.py --model sasrec --num-heads 4 --num-layers 2 --embedding-dim 64
-```
-
-注意：`--embedding-dim` 必须能被 `--num-heads` 整除。
+注意：`--embedding-dim` 必须能被 `--num-heads` 整除（SASRec 默认 `--num-heads 4`）。
 
 ## 7. 输出文件
 

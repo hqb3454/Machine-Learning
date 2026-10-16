@@ -67,3 +67,6 @@ desktop.ini
 # Environment variables
 .env
 .env.local
+
+# WorkBuddy local memory
+.workbuddy/
