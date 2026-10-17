@@ -28,12 +28,54 @@ from recommender_utils import (
 )
 
 
-class SASRecRecommender(nn.Module):
-    """SASRec-style sequential recommender using self-attention.
+class SASRecBlock(nn.Module):
+    """Single SASRec block with pre-layer-norm self-attention and FFN.
 
-    Adds positional embeddings to item embeddings and applies a stack of
-    causal Transformer encoder layers. Well suited to identifying which
-    past interactions are most predictive of future preferences.
+    Pre-LN is numerically stabler than the original post-LN Transformer
+    and avoids the NaN/inf validation losses seen with nn.TransformerEncoder.
+    """
+
+    def __init__(self, embedding_dim: int, hidden_dim: int, num_heads: int, dropout: float):
+        super().__init__()
+        self.attn_ln = nn.LayerNorm(embedding_dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=embedding_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.ffn_ln = nn.LayerNorm(embedding_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embedding_dim, hidden_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, embedding_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x, attn_mask, key_padding_mask):
+        # Pre-LN self-attention with residual
+        h = self.attn_ln(x)
+        h, _ = self.attn(
+            h, h, h,
+            attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        x = x + h
+
+        # Pre-LN feed-forward with residual
+        h = self.ffn_ln(x)
+        h = self.ffn(h)
+        x = x + h
+        return x
+
+
+class SASRecRecommender(nn.Module):
+    """SASRec-style sequential recommender using manually stacked attention blocks.
+
+    Replaces nn.TransformerEncoder with a custom stack of SASRecBlock layers
+    for better numerical stability when causal and padding masks are combined.
     """
 
     def __init__(
@@ -53,19 +95,26 @@ class SASRecRecommender(nn.Module):
         self.max_seq_len = max_seq_len
         self.item_embedding = nn.Embedding(num_items + 1, embedding_dim, padding_idx=PAD_ID)
         self.position_embedding = nn.Embedding(max_seq_len, embedding_dim)
-        self.layer_norm = nn.LayerNorm(embedding_dim)
         self.dropout = nn.Dropout(dropout)
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embedding_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim * 4,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.blocks = nn.ModuleList([
+            SASRecBlock(embedding_dim, hidden_dim, num_heads, dropout)
+            for _ in range(num_layers)
+        ])
+        self.final_ln = nn.LayerNorm(embedding_dim)
         self.head = nn.Linear(embedding_dim, num_items + 1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # Small initialization helps Pre-LN transformers stay stable early in training.
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, std=0.02)
 
     def forward(self, x):
         batch_size, seq_len = x.shape
@@ -77,11 +126,15 @@ class SASRecRecommender(nn.Module):
         )
 
         hidden = self.item_embedding(x) + self.position_embedding(positions)
-        hidden = self.dropout(self.layer_norm(hidden))
-        encoded = self.encoder(hidden, mask=causal_mask, src_key_padding_mask=padding_mask)
+        hidden = self.dropout(hidden)
+
+        for block in self.blocks:
+            hidden = block(hidden, attn_mask=causal_mask, key_padding_mask=padding_mask)
+
+        hidden = self.final_ln(hidden)
 
         # Sequences are left-padded, so the last column is the latest observed item.
-        logits = self.head(encoded[:, -1, :])
+        logits = self.head(hidden[:, -1, :])
         logits[:, PAD_ID] = -1e9
         return logits
 
